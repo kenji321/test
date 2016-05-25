@@ -1,0 +1,176 @@
+
+# go1.6の導入
+cd /usr/local/src
+wget https://storage.googleapis.com/golang/go1.6.linux-amd64.tar.gz ;tar -C /usr/local -xzf go1.6.linux-amd64.tar.gz
+cd /usr/local/;mkdir -p /usr/local/gopath/src
+
+# 環境変数設定（上３つはGOPATH、4つ目はローカルでのpeerのbuildに必要。）
+cd $HOME;cp -p .bash_profile .bash_profile.bk
+echo "export GOPATH=/usr/local/gopath" >> .bash_profile
+echo "export GOROOT=/usr/local/go" >> .bash_profile
+echo 'export PATH=$PATH:$GOROOT/bin:$GOPATH/bin' >> .bash_profile
+echo "export LD_LIBRARY_PATH=/usr/local/lib" >> .bash_profile
+. .bash_profile
+
+# gitの導入
+yum install -y git
+
+#fabricのソースコードのダウンロード
+cd $GOPATH/src;mkdir -p github.com/hyperledger;cd github.com/hyperledger
+git clone https://github.com/hyperledger/fabric.git
+
+# docker導入
+tee /etc/yum.repos.d/docker.repo <<-EOF
+[dockerrepo]
+name=Docker Repository
+baseurl=https://yum.dockerproject.org/repo/main/centos/7
+enabled=1
+gpgcheck=1
+gpgkey=https://yum.dockerproject.org/gpg
+EOF
+yum install -y docker-engine
+
+# docker compose導入⇒pip経由に置き換え
+# curl -L https://github.com/docker/compose/releases/download/1.7.0/docker-compose-`uname -s`-`uname -m` > /usr/local/bin/docker-compose;chmod +x /usr/local/bin/docker-compose
+
+# docker registryの導入
+mkdir $GOPATH/src/github.com/docker;cd $GOPATH/src/github.com/docker/
+git clone https://github.com/docker/distribution.git
+cd distribution
+export DISTRIBUTION_DIR=$GOPATH/src/github.com/docker/distribution
+make PREFIX=$GOPATH clean binaries
+#make PREFIX=$GOPATH test
+mkdir -p /var/lib/registry
+cd $DISTRIBUTION_DIR/cmd/registry/
+cp -p config-dev.yml config.yml
+
+cd /usr/lib/systemd/system/;cp -p docker.service docker.service.bk
+vi docker.service
+★以下を書き換える
+bef="ExecStart=/usr/bin/docker daemon -H fd://"
+aft="ExecStart=/usr/bin/docker daemon --api-enable-cors=true -H fd:// -H tcp://0.0.0.0:4243 -H unix:///var/run/docker.sock --insecure-registry 0.0.0.0:5000"
+
+systemctl daemon-reload
+systemctl stop docker.service
+systemctl start docker.service
+systemctl enable docker.service
+systemctl status docker.service
+
+mkdir $HOME/Dockerwork1;cd $HOME/Dockerwork1
+vi Dockerfile
+
+# Dockerfile for Hyperledger base image, with everything to go!
+# Data is stored under /var/hyperledger/db and /var/hyperledger/production
+# Under $GOPATH/bin, there are two config files: core.yaml and config.yaml.
+
+FROM library/ubuntu:xenial
+MAINTAINER IBM_TEST
+# install go
+ENV GOPATH /opt/gopath
+ENV GOROOT /opt/go
+ENV PATH /opt/gopath/bin:/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV DEBIAN_FRONTEND noninteractive
+RUN apt-get update \
+    && apt-get purge -y eject whiptail \
+    && apt-get install -y curl tar binutils \
+    && apt-get install -y apt-utils lsof net-tools \
+    && rm -rf /var/cache/apt /usr/share/doc /usr/share/man \
+    && cd /opt \
+    && curl -s https://storage.googleapis.com/golang/go1.6.linux-amd64.tar.gz | tar -xvzf - \
+    && rm -rf go/doc go/blog go/test go/blog go/api go/bin/godoc go/bin/gofmt \
+#    && ln -s /opt/go $GOPATH \
+#    && curl https://raw.githubusercontent.com/joequant/hyperledger/master/config/gopath.sh > /etc/profile.d/gopath.sh \
+#    && chmod 0755 /etc/profile.d/gopath.sh \
+    && mkdir -p /var/hyperledger/db \
+    && mkdir -p /var/hyperledger/production \
+    && strip --strip-unneeded /usr/bin/* /usr/sbin/* || true \
+    && strip --strip-unneeded /opt/go/bin/* /opt/go/pkg/tool/*/* || true
+RUN apt-get install -y protobuf-compiler libsnappy-dev zlib1g-dev libbz2-dev \
+        unzip \
+        build-essential git-core \
+        --no-install-recommends --no-install-suggests \
+        && strip --strip-unneeded /usr/bin/* /usr/sbin/* || true \
+        && strip --strip-unneeded /usr/lib/* /usr/local/lib/* || true \
+        && rm -rf /var/cache/apt /usr/share/doc /usr/share/man \
+        && cd /tmp \
+        && git clone --single-branch -b v4.1 --depth 1 https://github.com/facebook/rocksdb.git \
+        && cd rocksdb \
+        && PORTABLE=1 make shared_lib \
+        && INSTALL_PATH=/usr/local make install-shared \
+        && ldconfig \
+        && cd .. \
+        && rm -rf rocksdb \
+        && apt-get purge -y make patch xz-utils g++ libdpkg-perl libtimedate-perl \
+        && strip --strip-unneeded /usr/local/lib/* || true
+# install hyperledger
+RUN mkdir -p $GOPATH/src/github.com/hyperledger \
+        && cd $GOPATH/src/github.com/hyperledger \
+        && git clone --single-branch -b master --depth 1 https://github.com/hyperledger/fabric.git \
+        && cd $GOPATH/src/github.com/hyperledger/fabric/peer \
+        && CGO_CFLAGS=" " CGO_LDFLAGS="-lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy" go install \
+        && cp core.yaml $GOPATH/bin/ \
+        && go clean \
+        && cd $GOPATH/src/github.com/hyperledger/fabric/membersrvc \
+        && CGO_CFLAGS=" " CGO_LDFLAGS="-lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy" go install \
+        && cp membersrvc.yaml $GOPATH/bin/ \
+        && go clean \
+        && strip /opt/go/bin/* || true \
+        && cp $GOPATH/src/github.com/hyperledger/fabric/consensus/noops/config.yaml $GOPATH/bin
+WORKDIR "$GOPATH/bin
+
+------------------------------------------------
+
+# dockerイメージ作成
+docker build -t localhost:5000/fabric1.0 -f Dockerfile .
+
+#なんかpipが前提条件加わっている。
+yum install -y gcc-c++ protobuf-compiler snappy-devel zlib zlib-devel bzip2 bzip2-devel unzip lsof net-tools
+cd /usr/local/src;curl "https://bootstrap.pypa.io/get-pip.py" -o "get-pip.py"
+python get-pip.py
+pip install --upgrade pip
+pip install behave nose docker-compose
+pip install -I flask==0.10.1 python-dateutil==2.2 pytz==2014.3 pyyaml==3.10 couchdb==1.0 flask-cors==2.0.1 requests==2.4.3
+
+#git clone https://github.com/facebook/rocksdb.git
+# ⇒最新のrocksdb 4.8だとpeerのコンパイルでエラーになるので4.1を導入する。
+# ⇒Prerequisites：RocksDB version 4.1 and its dependencies
+git clone --single-branch -b v4.1 --depth 1 https://github.com/facebook/rocksdb.git
+cd /usr/local/src/rocksdb
+PORTABLE=1 make shared_lib
+INSTALL_PATH=/usr/local make install-shared
+ldconfig
+
+# install hyperledger
+# いつの間にかpeerのオプションが変わっていますのでご注意を
+cd $GOPATH/src/github.com/hyperledger/fabric/peer
+CGO_CFLAGS=" " CGO_LDFLAGS="-lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy" go install
+cp core.yaml $GOPATH/bin/
+cd $GOPATH/src/github.com/hyperledger/fabric/membersrvc
+CGO_CFLAGS=" " CGO_LDFLAGS="-lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy" go install
+cp membersrvc.yaml $GOPATH/bin/
+
+cp $GOPATH/src/github.com/hyperledger/fabric/consensus/noops/config.yaml $GOPATH/bin/config_noops.yaml
+cp $GOPATH/src/github.com/hyperledger/fabric/consensus/obcpbft/config.yaml $GOPATH/bin/config_pbft.yaml
+cp $GOPATH/bin/config_pbft.yaml $GOPATH/bin/config.yaml
+
+# rocksdbのsoファイル用の環境変数を設定
+# ⇒これがないとpeerが起動しない
+# 例）./peer: error while loading shared libraries: librocksdb.so.4.1: cannot open shared object file: No such file or directory
+
+
+
+dev-mode起動⇒多分、dev-modeはdocker起動前提だからうまく動かないはず。
+-------
+cd $GOPATH/src/github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02
+go install
+
+CORE_VM_ENDPOINT=http://172.17.0.1:4243 CORE_PEER_ID=vp1 CORE_PEER_ADDRESSAUTODETECT=true CORE_CHAINCODE_ID_NAME=test peer node start --peer-chaincodedev
+
+peer node start --peer-chaincodedev
+
+
+peer chaincode deploy -p cahincode_exsample02 -n test -c '{"Function":"init", "Args": ["a","100", "b", "200"]}'
+peer chaincode query -l golang -n test -c '{"Function": "query", "Args": ["a" ]}'
+peer chaincode invoke -n test -c '{"Function": "invoke", "Args": [ "a", "b", "10"]}'
+
+
